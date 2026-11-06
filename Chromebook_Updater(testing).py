@@ -3,7 +3,6 @@
 Pick ChromeOS recovery images with fzf and download the zips.
 
 Data source: https://github.com/MercuryWorkshop/chromeos-releases-data
-(JSON data is CC-BY licensed, please keep the attribution.)
 
 Usage:
     ./chromeos_dl.py                       # stable-channel only: octopus, dedede, skywalker, corsola
