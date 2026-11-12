@@ -1,0 +1,6 @@
+# Downloaded recovery images and daemon state (created next to the scripts at runtime)
+ChromeOS-recovery/
+state/
+__pycache__/
+*.pyc
+*.part
