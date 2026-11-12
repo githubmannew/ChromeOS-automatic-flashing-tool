@@ -31,7 +31,7 @@ To remove it: `.\Setup-ChromeOSWatch.ps1 -Uninstall` (keeps downloads and settin
 
 ### How it works
 
-- The daemon watches these boards by default: octopus, dedede, skywalker, corsola. On first run it only records what already exists and downloads nothing; it downloads when a newer release appears.
+- The daemon watches these boards by default: octopus, dedede, skywalker, corsola. If a board has no image on disk yet (fresh install, or a newly added board), it downloads the newest one (about 3 GB each, one at a time), then keeps it up to date. Older images are deleted when a newer one arrives.
 - When you flash a Chromebook model, its board is added to the watch list automatically, so the tool keeps itself up to date without maintenance.
 - The model list refreshes every 24 hours.
 - Flashing refuses boot and system disks, shows only USB/SD drives, and requires you to type the drive name to confirm.

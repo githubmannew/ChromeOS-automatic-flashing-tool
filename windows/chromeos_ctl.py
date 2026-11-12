@@ -364,7 +364,7 @@ def cmd_set(pairs: list[str], hint: bool = True) -> int:
         for k, v in cfg.items():
             print(f"  {k:<17} {', '.join(v) if isinstance(v, list) else v}")
         if hint:
-            print("\nChange with:  chromeos_ctl.py set interval=600 boards=octopus,dedede channel=any include_existing=false")
+            print("\nChange with:  chromeos_ctl.py set interval=600 boards=octopus,dedede channel=any keep=2")
         return 0
     values = {}
     for p in pairs:

@@ -54,7 +54,6 @@ DEFAULT_CONFIG = {
     "boards": ["octopus", "dedede", "skywalker", "corsola"],
     "channel": "stable-channel",   # or "any"
     "interval": 300,               # seconds between index checks
-    "include_existing": False,     # on first sight of a board, also fetch its newest existing image
     "paused": False,
     "keep": 1,                     # images kept per board+channel; older ones are deleted when a new release arrives
 }
@@ -154,7 +153,7 @@ def coerce_setting(key: str, value):
         if v < 1:
             raise ValueError("keep must be at least 1")
         return v
-    if key in ("include_existing", "paused"):
+    if key == "paused":
         if isinstance(value, bool):
             return value
         v = str(value).strip().lower()
@@ -349,6 +348,7 @@ class Daemon:
         saved = read_json(self.p.seen, {}) or {}
         self.seen: set[str] = set(saved.get("seen", []))
         self.baselined: set[str] = set(saved.get("baselined", []))
+        self.declined: set[str] = set(saved.get("declined", []))   # images the user skipped/cancelled: never auto-fetch
         self.index: dict | None = None
         self.etag: str | None = None
         self.checking = False
@@ -361,7 +361,8 @@ class Daemon:
 
     # ----- persistence
     def save_seen(self) -> None:
-        atomic_write_json(self.p.seen, {"seen": sorted(self.seen), "baselined": sorted(self.baselined)})
+        atomic_write_json(self.p.seen, {"seen": sorted(self.seen), "baselined": sorted(self.baselined),
+                                        "declined": sorted(self.declined)})
 
     def save_config(self) -> None:
         atomic_write_json(self.p.config, self.cfg)
@@ -498,18 +499,21 @@ class Daemon:
                 if not cur:
                     return False, "nothing is downloading"
                 self.seen.add(cur.url)
+                self.declined.add(cur.url)
                 self.save_seen()
                 self.interrupt = "cancel"
                 return True, f"cancelled {cur.name} (partial file kept; use 'get' to fetch it later)"
             before = len(self.queue)
             self.queue = [q for q in self.queue if q.url != url]
             self.seen.add(url)
+            self.declined.add(url)
             self.save_seen()
             return (before != len(self.queue)), ("removed from queue" if before != len(self.queue) else "not in queue")
 
         if name == "clear":
             n = len(self.queue)
             self.seen.update(j.url for j in self.queue)
+            self.declined.update(j.url for j in self.queue)
             self.queue = []
             self.save_seen()
             return True, f"cleared {n} queued item(s)"
@@ -578,15 +582,20 @@ class Daemon:
             if key not in self.baselined:
                 # First time we see this board/channel: don't pull the whole back catalogue.
                 self.baselined.add(key)
-                if self.cfg["include_existing"]:
-                    self.seen.update(i["url"] for i in imgs[1:])    # keep only the newest one to fetch
-                    log.info("%s (%s): will fetch the newest existing image, then only newer ones",
-                             board, tag)
-                else:
-                    self.seen.update(i["url"] for i in imgs)
-                    log.info("%s (%s): recorded %d existing images, will only fetch newer ones",
-                             board, tag, len(imgs))
-                    continue
+                self.seen.update(i["url"] for i in imgs)
+                log.info("%s (%s): recorded %d existing images", board, tag, len(imgs))
+            # Nothing on disk for this board? Fetch the newest image, so a fresh install (or a newly
+            # added board) ends up with something usable. Skipped/cancelled images are not re-queued.
+            if imgs:
+                folder = self.p.images / board
+                have = any((folder / i["url"].rsplit("/", 1)[-1]).exists() for i in imgs)
+                newest = max(imgs, key=lambda i: i.get("last_modified", 0))
+                if not have and newest["url"] not in self.declined and newest["url"] not in queued:
+                    self.queue.append(Job(newest["url"], board, source="auto"))
+                    queued.add(newest["url"])
+                    added += 1
+                    log.info("no image on disk for %s: fetching the newest (%s, %s)", board,
+                             newest["platform_version"], fmt_date(newest["last_modified"]))
             for img in sorted(imgs, key=lambda i: i.get("last_modified", 0)):   # oldest first
                 url = img["url"]
                 if url in self.seen or url in queued:
@@ -826,8 +835,6 @@ def write_config_cli(root: Path, a: argparse.Namespace) -> int:
             cfg["channel"] = coerce_setting("channel", a.channel)
         if a.interval:
             cfg["interval"] = coerce_setting("interval", a.interval)
-        if a.include_existing:
-            cfg["include_existing"] = True
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -847,7 +854,7 @@ def main() -> int:
     ap.add_argument("--boards", nargs="+")
     ap.add_argument("--channel")
     ap.add_argument("--interval", type=int)
-    ap.add_argument("--include-existing", action="store_true")
+    ap.add_argument("--include-existing", action="store_true", help=argparse.SUPPRESS)   # old setup scripts; now a no-op
     a = ap.parse_args()
     root = a.root.resolve()
     if a.write_config:

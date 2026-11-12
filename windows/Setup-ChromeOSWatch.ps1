@@ -31,7 +31,6 @@ param(
     [string[]]$Boards,                 # default: octopus, dedede, skywalker, corsola
     [string]$Channel,                  # default: stable-channel ("any" = all channels)
     [int]$IntervalSeconds,             # default: 300 (minimum 60)
-    [switch]$IncludeExisting,          # also fetch the newest image that already exists for each board
     [string]$User = [Security.Principal.WindowsIdentity]::GetCurrent().Name,   # who the daemon runs as
     [string]$DesktopDir = [Environment]::GetFolderPath('Desktop'),   # where the launcher .bat is placed
     [switch]$NoInstall,                # do not try to install Python / fzf with winget
@@ -195,7 +194,6 @@ $cfgArgs = @($Daemon, '--root', $Root, '--write-config')
 if ($PSBoundParameters.ContainsKey('Boards') -and $Boards) { $cfgArgs += '--boards'; $cfgArgs += $Boards }
 if ($PSBoundParameters.ContainsKey('Channel') -and $Channel) { $cfgArgs += '--channel'; $cfgArgs += $Channel }
 if ($PSBoundParameters.ContainsKey('IntervalSeconds') -and $IntervalSeconds -gt 0) { $cfgArgs += '--interval'; $cfgArgs += [string]$IntervalSeconds }
-if ($IncludeExisting) { $cfgArgs += '--include-existing' }
 $cfgOut = & $py.Exe @cfgArgs
 if ($LASTEXITCODE -ne 0) { Fail "Could not write settings: $cfgOut" }
 Say "Settings: $cfgOut"
@@ -304,6 +302,6 @@ Write-Host '     Windows asks for Administrator permission every time; that is d
 Write-Host '     It shows live progress and lets you download a specific image now, force a refresh, pause, change settings.'
 Write-Host '  2. To flash a USB drive choose "Flash" in that menu.'
 Write-Host "  Downloads go to: $(Join-Path $Root 'ChromeOS-recovery')"
-Write-Host '  Note: the first run only records what is already published. Only NEWER images are downloaded'
-Write-Host '        automatically. Use the menu to grab any existing one, or re-run setup with -IncludeExisting.'
+Write-Host '  Note: the daemon now downloads the newest image for each watched board (about 3 GB each) if you do not'
+Write-Host '        have one yet, then keeps it up to date. Watch progress with "Live status" in the menu.'
 Write-Host '  Remove everything with:   .\Setup-ChromeOSWatch.ps1 -Uninstall'
