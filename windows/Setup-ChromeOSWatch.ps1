@@ -159,6 +159,16 @@ if (-not $py) {
 }
 Say ("Python  : {0} (3.{1})" -f $py.Exe, ($py.Version % 100))
 
+# Certificate list used as a fallback when Windows lacks a root certificate (common on fresh machines).
+# Best effort: the daemon works without it wherever Windows already trusts the download servers.
+try {
+    $null = & $py.Exe -m pip install --quiet --disable-pip-version-check --upgrade certifi 2>&1
+    if ($LASTEXITCODE -eq 0) { Say 'Certificates: fallback list installed.' }
+    else { Warn 'Could not install the certificate fallback list (certifi). Downloads still work if Windows trusts Google.' }
+} catch {
+    Warn 'Could not install the certificate fallback list (certifi). Downloads still work if Windows trusts Google.'
+}
+
 # ---------------------------------------------------------------- fzf (optional)
 function Get-FzfPath {
     $c = Get-Command fzf.exe -ErrorAction SilentlyContinue

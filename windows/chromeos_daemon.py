@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import time
@@ -170,6 +171,38 @@ def data_urls() -> list[str]:
     return [env] if env else list(DATA_URLS)
 
 
+_TLS_CONTEXT: list = [None]   # None = Python's default (uses the Windows certificate store)
+
+
+def _wider_tls_context():
+    """Windows store + the Mozilla root list (certifi). None if certifi isn't installed."""
+    try:
+        import certifi
+        ctx = ssl.create_default_context()
+        ctx.load_verify_locations(cafile=certifi.where())
+        return ctx
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def open_url(req: urllib.request.Request, timeout: float):
+    """urlopen with certificate checking always on. A fresh Windows machine often lacks some root
+    certificates (Windows adds them lazily), which shows up as CERTIFICATE_VERIFY_FAILED; in that case
+    retry once with a wider trust list instead of failing every download."""
+    try:
+        return urllib.request.urlopen(req, timeout=timeout, context=_TLS_CONTEXT[0])
+    except urllib.error.URLError as e:
+        if not isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError) or _TLS_CONTEXT[0] is not None:
+            raise
+        ctx = _wider_tls_context()
+        if ctx is None:
+            raise
+        resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)   # still verified; raises if it fails
+        _TLS_CONTEXT[0] = ctx
+        log.warning("Windows is missing a root certificate for %s; using the Mozilla list from certifi", req.full_url.split("/")[2])
+        return resp
+
+
 def fetch_index(etag: str | None = None) -> tuple[dict | None, str | None]:
     """Download the releases index. Returns (data, etag); data is None on 304 Not Modified."""
     last: Exception | None = None
@@ -178,7 +211,7 @@ def fetch_index(etag: str | None = None) -> tuple[dict | None, str | None]:
         if etag:
             headers["If-None-Match"] = etag
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as r:
+            with open_url(urllib.request.Request(url, headers=headers), 60) as r:
                 return json.load(r), r.headers.get("ETag")
         except urllib.error.HTTPError as e:
             if e.code == 304:
@@ -708,7 +741,7 @@ class Daemon:
             if resume:
                 headers["Range"] = f"bytes={resume}-"
             try:
-                resp = urllib.request.urlopen(urllib.request.Request(job.url, headers=headers), timeout=30)
+                resp = open_url(urllib.request.Request(job.url, headers=headers), 30)
             except urllib.error.HTTPError as e:
                 if e.code == 416 and resume:      # our partial file is complete or unusable
                     try:
