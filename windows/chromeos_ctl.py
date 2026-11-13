@@ -424,7 +424,7 @@ foreach ($d in (Get-Disk | Where-Object { $_.BusType -in 'USB','SD','MMC' -and -
         $v = Get-Volume -DriveLetter $l -ErrorAction SilentlyContinue
         $vols += ('{0}: {1}' -f $l, $v.FileSystemLabel)
     }
-    $out += [pscustomobject]@{ Number = [int]$d.Number; Model = [string]$d.FriendlyName; Size = [int64]$d.Size; Letters = $letters; Volumes = $vols }
+    $out += [pscustomobject]@{ Number = [int]$d.Number; Model = [string]$d.FriendlyName; Size = [int64]$d.Size; Letters = $letters; Volumes = $vols; Sector = [int]$d.LogicalSectorSize }
 }
 ConvertTo-Json -InputObject @($out) -Compress -Depth 4
 """
@@ -452,6 +452,11 @@ def _win_kernel32():
                                     wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
                                     wintypes.LPVOID]
     k32.DeviceIoControl.restype = wintypes.BOOL
+    k32.WriteFile.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD,
+                              ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+    k32.WriteFile.restype = wintypes.BOOL
+    k32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    k32.FlushFileBuffers.restype = wintypes.BOOL
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
     k32.CloseHandle.restype = wintypes.BOOL
     return k32
@@ -488,6 +493,80 @@ def _win_close(handles: list[int]) -> None:
     k32 = _win_kernel32()
     for h in handles:
         k32.CloseHandle(h)
+
+
+def _win_error(code: int) -> str:
+    import ctypes
+    fmt = getattr(ctypes, "FormatError", None)
+    return f"Windows error {code}" + (f": {fmt(code).strip()}" if fmt and code else "")
+
+
+def _last_error() -> int:
+    import ctypes
+    return ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else 0
+
+
+FLASH_LOG = P.state / "flash.log"
+
+
+def flash_log(msg: str) -> None:
+    try:
+        P.state.mkdir(parents=True, exist_ok=True)
+        with open(FLASH_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+    except OSError:
+        pass
+
+
+class _RawDisk:
+    """Writes to a physical drive through the Win32 API so a failure reports the real Windows error code."""
+
+    def __init__(self, path: str, k32=None):
+        self.k32 = k32 or _win_kernel32()
+        self.h = None
+        GENERIC_READ_WRITE, SHARE_READ_WRITE, OPEN_EXISTING = 0xC0000000, 0x3, 3
+        h = self.k32.CreateFileW(path, GENERIC_READ_WRITE, SHARE_READ_WRITE, None, OPEN_EXISTING, 0, None)
+        if not h or h == -1 or h == 0xFFFFFFFFFFFFFFFF:
+            code = _last_error()
+            if code == 5:
+                raise PermissionError(f"could not open {path} ({_win_error(code)})")
+            raise OSError(f"could not open {path} ({_win_error(code)})")
+        self.h = h
+
+    def write(self, data: bytes) -> None:
+        import ctypes
+        from ctypes import wintypes
+        buf = ctypes.create_string_buffer(data, len(data))
+        done = wintypes.DWORD()
+        if not self.k32.WriteFile(self.h, buf, len(data), ctypes.byref(done), None):
+            raise OSError(_win_error(_last_error()))
+        if done.value != len(data):
+            raise OSError(f"short write ({done.value} of {len(data)} bytes)")
+
+    def flush(self) -> None:
+        self.k32.FlushFileBuffers(self.h)
+
+    def close(self) -> None:
+        if self.h is not None:
+            self.k32.CloseHandle(self.h)
+            self.h = None
+
+
+_DIAG_PS = r"""
+$ErrorActionPreference = 'Continue'
+Get-Disk -Number @@N@@ | Format-List Number,FriendlyName,BusType,OperationalStatus,HealthStatus,IsOffline,IsReadOnly,PartitionStyle,LogicalSectorSize,PhysicalSectorSize | Out-String
+'--- recent disk/USB events (last 10 min) ---'
+Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=(Get-Date).AddMinutes(-10)} -ErrorAction SilentlyContinue |
+  Where-Object { $_.ProviderName -match 'disk|stor|usb|partmgr|volmgr|nvme' } | Select-Object -First 12 |
+  ForEach-Object { '{0}  {1} {2}: {3}' -f $_.TimeCreated, $_.ProviderName, $_.Id, (($_.Message -split "`n")[0]) }
+"""
+
+
+def _flash_diagnostics(num: int) -> None:
+    try:
+        flash_log("disk state after failure:\n" + _ps(_DIAG_PS.replace("@@N@@", str(num)), check=False))
+    except Exception as e:  # noqa: BLE001 - diagnostics must never hide the real error
+        flash_log(f"could not collect diagnostics: {e}")
 
 
 def _read_full(f, n: int) -> bytes:
@@ -572,37 +651,67 @@ def flash_windows(zip_path: Path, drive: dict, model: str | None = None, n_model
         if input(f"Type {ident} to confirm, anything else cancels: ").strip() != ident:
             print("Cancelled.")
             return False
+        sector = max(int(drive.get("Sector") or SECTOR), SECTOR)
+        flash_log(f"START {zip_path.name} -> {ident} ({drive.get('Model', '')}, {size} bytes, sector {sector}, "
+                  f"letters {drive['Letters']})")
         handles: list[int] = []
+        raw = None
+        done = 0
         try:
-            handles = _win_lock_volumes(drive["Letters"])
-            print("\nFlashing, do not unplug the drive...")
-            total, done, t0 = member.file_size, 0, time.monotonic()
-            with open(target, "r+b", buffering=0) as dst, zf.open(member) as src:
+            # Remove the old partition table first so Windows has no volumes on this disk to react to
+            # when the new partition table lands in the first sectors.
+            print("\nPreparing the drive...")
+            # Windows can renumber drives when USB devices come and go: make sure this number is still the
+            # same removable disk that was shown above before anything is erased.
+            same = _ps(f"$d = Get-Disk -Number {num} -ErrorAction SilentlyContinue; "
+                       f"if ($d -and -not $d.IsBoot -and -not $d.IsSystem -and $d.BusType -in 'USB','SD','MMC' "
+                       f"-and $d.Size -eq [uint64]{size}) {{ 'same' }} else {{ 'different' }}", check=False)
+            if "same" not in same:
+                print(f"\n{ident} is no longer the drive that was shown (it was unplugged or renumbered). "
+                      "Nothing was changed. Start the flash again.", file=sys.stderr)
+                flash_log(f"ABORT {ident} changed before writing: {same!r}")
+                return False
+            out = _ps(f"Set-Disk -Number {num} -IsOffline $false -ErrorAction SilentlyContinue; "
+                      f"Set-Disk -Number {num} -IsReadOnly $false -ErrorAction SilentlyContinue; "
+                      f"Clear-Disk -Number {num} -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop; 'cleared'",
+                      check=False)
+            flash_log(f"clear disk: {out or 'no output (failed or already clean)'}")
+            if "cleared" not in out:
+                handles = _win_lock_volumes(drive["Letters"])    # fall back to locking what we can see
+            time.sleep(1)
+            print("Flashing, do not unplug the drive...")
+            total, t0 = member.file_size, time.monotonic()
+            raw = _RawDisk(target)
+            with zf.open(member) as src:
                 while True:
                     data = _read_full(src, CHUNK)
                     if not data:
                         break
                     real = len(data)
-                    data += b"\0" * (-real % SECTOR)       # raw writes must be whole sectors
-                    if dst.write(data) != len(data):
-                        raise OSError("short write to drive")
+                    data += b"\0" * (-real % sector)       # raw writes must be whole sectors
+                    raw.write(data)
                     done += real
                     rate = done / max(time.monotonic() - t0, 0.001)
                     print(f"\r  {bar(done / max(total, 1), 28)} {done * 100 // max(total, 1):3d}%  "
                           f"{cd.human(done)} / {cd.human(total)}  {cd.human(rate)}/s   ", end="", flush=True)
-                print()
-                try:
-                    os.fsync(dst.fileno())
-                except OSError:
-                    pass
-        except PermissionError:
-            print(f"\nAccess denied for {target}. Use an Administrator terminal and close anything using the drive.",
+            print()
+            raw.flush()
+            flash_log(f"wrote {done} bytes OK")
+        except PermissionError as e:
+            print(f"\nAccess denied: {e}. Use an Administrator terminal and close anything using the drive.",
                   file=sys.stderr)
+            flash_log(f"FAILED access denied: {e}")
             return False
         except (OSError, RuntimeError) as e:
             print(f"\nFlashing failed: {e}", file=sys.stderr)
+            print("The drive is now partly written and will not boot a Chromebook. Run the flash again.\n"
+                  f"Details were saved to {FLASH_LOG}", file=sys.stderr)
+            flash_log(f"FAILED after {done} bytes: {e}")
+            _flash_diagnostics(num)
             return False
         finally:
+            if raw:
+                raw.close()
             if handles:
                 _win_close(handles)
     _ps(f"Update-Disk -Number {num} -ErrorAction SilentlyContinue", check=False)   # refresh Windows' view
