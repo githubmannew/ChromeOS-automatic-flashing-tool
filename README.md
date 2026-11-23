@@ -14,8 +14,8 @@ Everything lives in one folder. Images are downloaded to a `ChromeOS-recovery` f
 | File | Role |
 |---|---|
 | `Setup-ChromeOSWatch.ps1` | Installer. Run as Administrator. Installs Python and fzf if missing (via winget), registers the background task, and puts a **ChromeOS Watch.bat** launcher on the Desktop. |
-| `chromeos_daemon.py` | Background downloader. Checks for new images about every 5 minutes and downloads one at a time. Keeps the newest image per board and deletes the older ones. |
-| `chromeos_ctl.py` | Control tool, opened by the Desktop launcher. Shows live download status, lets you pull a specific image now, pause, skip, change settings, look up a Chromebook by model, and flash a USB drive. |
+| `chromeos_daemon.py` | Background downloader. Checks for new images about every 5 minutes and downloads one at a time. Always keeps the latest stable image per board on disk (compared by version number) and deletes the older ones. |
+| `chromeos_ctl.py` | Control tool, opened by the Desktop launcher. Shows live download status, lets you pull a specific image now, pause, skip, change settings, look up a Chromebook by model, list downloaded images with their download dates (menu option 4, or `chromeos_ctl.py downloaded`), and flash a USB drive. |
 
 ### Install
 

@@ -32,6 +32,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -345,6 +346,30 @@ def cmd_get(patterns, boards, channel, now: bool, force: bool) -> int:
 
 
 # --------------------------------------------------------------------------- other commands
+
+def cmd_downloaded() -> int:
+    """List every image on disk, newest download first, with when it was downloaded."""
+    rec = cd.read_json(P.downloads, {}) or {}
+    rows = []
+    for f in P.images.glob("*/*.zip"):
+        if not f.is_file():
+            continue
+        board = f.parent.name
+        m = re.match(r"chromeos_([\d.]+)_[^_]+_recovery_([^_]+)_", f.name)
+        version, channel = (m.group(1), m.group(2)) if m else ("?", "?")
+        when = rec.get(f"{board}/{f.name}") or f.stat().st_mtime   # file time if the daemon never recorded it
+        rows.append((when, board, version, channel, f.stat().st_size, f.name))
+    if not rows:
+        print(f"No images downloaded yet (looked in {P.images}).")
+        return 0
+    rows.sort(reverse=True)
+    print(f"{'Downloaded':<17} {'Board':<10} {'Version':<13} {'Channel':<15} {'Size':>9}  File")
+    for when, board, version, channel, size, name in rows:
+        print(f"{datetime.fromtimestamp(when).strftime('%Y-%m-%d %H:%M'):<17} {board:<10} {version:<13} "
+              f"{channel:<15} {cd.human(size):>9}  {name}")
+    print(f"\n{len(rows)} image(s), {cd.human(sum(r[4] for r in rows))} total, in {P.images}")
+    return 0
+
 
 def cmd_cancel(pattern: str | None) -> int:
     if not pattern:
@@ -1048,10 +1073,11 @@ def cmd_menu() -> int:
             ("1", f"Live status  -  {status_oneliner()}"),
             ("2", "Find my Chromebook: search model, download, flash"),
             ("3", "Flash an already-downloaded image"),
-            ("4", "ChromeOS image options"),
-            ("5", "Settings (boards, interval, channel)"),
-            ("6", "Show recent log"),
-            ("7", "Restart the daemon"),
+            ("4", "List downloaded images and when they were downloaded"),
+            ("5", "ChromeOS image options"),
+            ("6", "Settings (boards, interval, channel)"),
+            ("7", "Show recent log"),
+            ("8", "Restart the daemon"),
         ], "Quit")
         if k is None:
             return 0
@@ -1059,23 +1085,25 @@ def cmd_menu() -> int:
             if k == "1":
                 cmd_status(True)
                 continue
-            if k == "4":
+            if k == "5":
                 image_options_menu()
                 continue
             if k == "2":
                 cmd_find()
             elif k == "3":
                 cmd_flash(None)
-            elif k == "5":
+            elif k == "4":
+                cmd_downloaded()
+            elif k == "6":
                 print("Settings\n")
                 cmd_set([], hint=False)
                 print("\nTo change, type one or more, e.g.:  interval=600 keep=2 boards=octopus,dedede channel=any")
                 raw = input("Change (blank to skip): ").strip()
                 if raw:
                     cmd_set(raw.split())
-            elif k == "6":
-                cmd_logs(False)
             elif k == "7":
+                cmd_logs(False)
+            elif k == "8":
                 send("restart")
         except (KeyboardInterrupt, EOFError):
             print()
@@ -1123,6 +1151,8 @@ def main() -> int:
     p = sub.add_parser("set", help="show or change settings")
     p.add_argument("pairs", nargs="*", help="key=value ...")
 
+    sub.add_parser("downloaded", help="list images on disk and when they were downloaded")
+
     p = sub.add_parser("logs", help="show the daemon log")
     p.add_argument("-f", "--follow", action="store_true")
     p.add_argument("-n", type=int, default=40)
@@ -1152,6 +1182,8 @@ def main() -> int:
             return cmd_cancel(a.text)
         if a.cmd == "set":
             return cmd_set(a.pairs)
+        if a.cmd == "downloaded":
+            return cmd_downloaded()
         if a.cmd == "logs":
             return cmd_logs(a.follow, a.n)
         if a.cmd == "find":

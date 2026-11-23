@@ -82,6 +82,7 @@ def make_paths(root: Path) -> SimpleNamespace:
         lock=state / "daemon.lock",
         crash=state / "crash.log",
         models=state / "models.json",
+        downloads=state / "downloads.json",
     )
 
 
@@ -222,6 +223,23 @@ def fetch_index(etag: str | None = None) -> tuple[dict | None, str | None]:
     raise RuntimeError(f"could not fetch release index: {last}")
 
 
+def version_key(img: dict) -> tuple:
+    """Sort key: ChromeOS platform version (16836.33.0 -> (16836, 33, 0)), upload time as tie-breaker.
+    Ordering by version, not upload time, means a late-published older build can never count as 'latest'."""
+    nums = tuple(int(x) for x in re.findall(r"\d+", str(img.get("platform_version", ""))))
+    return nums, img.get("last_modified", 0)
+
+
+def latest_per_channel(imgs: list[dict]) -> list[dict]:
+    """The single newest image of each channel in `imgs`."""
+    best: dict[str, dict] = {}
+    for img in imgs:
+        ch = img.get("channel", "")
+        if ch not in best or version_key(img) > version_key(best[ch]):
+            best[ch] = img
+    return list(best.values())
+
+
 def get_images(data: dict, board: str, channel: str | None) -> list[dict]:
     """Real image entries for a board (skips the credit placeholder entry), newest first."""
     out = []
@@ -232,7 +250,7 @@ def get_images(data: dict, board: str, channel: str | None) -> list[dict]:
         if channel and img.get("channel") != channel:
             continue
         out.append(img)
-    out.sort(key=lambda i: i.get("last_modified", 0), reverse=True)
+    out.sort(key=version_key, reverse=True)
     return out
 
 
@@ -600,50 +618,34 @@ class Daemon:
             self.write_status(force=True)
 
     def _scan_index(self) -> None:
+        """Make sure the newest image of the watched channel is on disk for every board.
+        Compares against what is actually on disk, not against a list of 'seen' URLs, so a missed
+        release, an old image left in the folder, or a deleted file is always noticed."""
         if not self.index:
             return
         channel = channel_filter(self.cfg)
-        tag = channel or "any"
         queued = {j.url for j in self.queue} | ({self.current.url} if self.current else set())
         added = 0
         for board in self.cfg["boards"]:
             if board not in self.index:
                 log.warning("board '%s' is not in the release index", board)
                 continue
-            imgs = get_images(self.index, board, channel)
-            key = f"{board}|{tag}"
-            if key not in self.baselined:
-                # First time we see this board/channel: don't pull the whole back catalogue.
-                self.baselined.add(key)
-                self.seen.update(i["url"] for i in imgs)
-                log.info("%s (%s): recorded %d existing images", board, tag, len(imgs))
-            # Nothing on disk for this board? Fetch the newest image, so a fresh install (or a newly
-            # added board) ends up with something usable. Skipped/cancelled images are not re-queued.
-            if imgs:
-                folder = self.p.images / board
-                have = any((folder / i["url"].rsplit("/", 1)[-1]).exists() for i in imgs)
-                newest = max(imgs, key=lambda i: i.get("last_modified", 0))
-                if not have and newest["url"] not in self.declined and newest["url"] not in queued:
-                    self.queue.append(Job(newest["url"], board, source="auto"))
-                    queued.add(newest["url"])
-                    added += 1
-                    log.info("no image on disk for %s: fetching the newest (%s, %s)", board,
-                             newest["platform_version"], fmt_date(newest["last_modified"]))
-            for img in sorted(imgs, key=lambda i: i.get("last_modified", 0)):   # oldest first
+            for img in latest_per_channel(get_images(self.index, board, channel)):
                 url = img["url"]
-                if url in self.seen or url in queued:
-                    continue
-                if (self.p.images / board / url.rsplit("/", 1)[-1]).exists():
+                name = url.rsplit("/", 1)[-1]
+                if (self.p.images / board / name).exists():
                     self.seen.add(url)
+                    continue
+                if url in self.declined or url in queued:
                     continue
                 self.queue.append(Job(url, board, source="auto"))
                 queued.add(url)
                 added += 1
-                log.info("new image: %s %s (chrome %s, %s)", board, img["platform_version"],
-                         img.get("chrome_version", "?"), fmt_date(img["last_modified"]))
+                log.info("latest %s for %s is %s (chrome %s, %s): not on disk, queued", img["channel"], board,
+                         img["platform_version"], img.get("chrome_version", "?"), fmt_date(img["last_modified"]))
         self.save_seen()
         if not added:
-            log.info("check complete: nothing new")
+            log.info("check complete: latest images already on disk")
 
     # ----- downloading
     def tick(self) -> None:
@@ -692,7 +694,7 @@ class Daemon:
         for f in folder.glob("*.zip"):
             img = by_name.get(f.name)
             if img and img["channel"] == new["channel"]:
-                same.append((img.get("last_modified", 0), f))
+                same.append((version_key(img), f))
         same.sort(key=lambda t: t[0], reverse=True)
         for _ts, f in same[keep:]:
             try:
@@ -719,6 +721,12 @@ class Daemon:
         else:
             raise err  # type: ignore[misc]
         log.info("finished %s (%s)", job.name, human(dest.stat().st_size))
+        try:   # remember when it arrived (the control tool's "downloaded images" list shows this)
+            rec = read_json(self.p.downloads, {}) or {}
+            rec[f"{job.board}/{job.name}"] = time.time()
+            atomic_write_json(self.p.downloads, rec)
+        except OSError as e:
+            log.warning("could not record download time: %s", e)
         return "done"
 
     def download(self, job: Job) -> str:
